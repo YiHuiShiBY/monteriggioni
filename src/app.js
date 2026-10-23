@@ -405,8 +405,9 @@ export async function boot({ app, loadingEl, errEl, onProgress }) {
     b.addEventListener('click', () => glideTo(b.dataset.view));
   });
   addEventListener('keydown', (e) => {
-    const i = VIEW_NAMES.indexOf(e.key);
-    if (i >= 0) glideTo(VIEW_NAMES[i]);
+    /* 界面按数字键 1–4 切机位：e.key 是 '1'..'4'，不是机位名 */
+    const i = Number(e.key) - 1;
+    if (Number.isInteger(i) && i >= 0 && i < VIEW_NAMES.length) glideTo(VIEW_NAMES[i]);
   });
   document.querySelector('.views').hidden = false;
 

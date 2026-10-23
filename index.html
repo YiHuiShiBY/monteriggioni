@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Monteriggioni · 照片重建小镇</title>
+
+<!--
+════════════════════════════════════════════════════════════════════════════
+  Monteriggioni · 着色与呈现层重做 — 最终调参记录
+  规格依据：OPTIMIZATION.md ｜ three r160（vendor/three.module.js，纯静态本地依赖）
+════════════════════════════════════════════════════════════════════════════
+
+【不可动的资产】Monteriggioni.glb（27.6 MB，2594 primitive，92 材质，0 贴图）。
+  所有 primitive 属性集均为 ('NORMAL','POSITION') —— 无 TEXCOORD_0 / COLOR_0 / TANGENT，
+  因此本轮**不新增任何顶点属性**，一律走世界坐标三平面（triplanar）采样。
+  屋顶瓦片在 Blender 里已逐片建模并按材质合并（48 个 weathering N tile NN 材质 = 逐片色差），
+  贴图**只叠加风化/苔痕/明度渐变，绝不重画瓦垄**（会与几何叠成摩尔纹）。
+
+【太阳】DirectionalLight   —— 真值在 src/lighting.js 的 TUNE.sun
+  方位角 azimuth   = 68°   （0° = +Z，逆时针为正。改这一条的理由见下面三行）
+  高度角 elevation = 42°   （托斯卡纳午后约 15:00）
+  距离 distance    = 520 m （只决定阴影相机 near/far，不改变方向）
+    68° 是第二轮才换的：航拍机位方位 -39°、town 机位 -19.5°，最初的 14° 对这两
+    个都几乎是正对相机的顺光，墙面被拍平、砌缝读不出来；68° 对航拍是 107° 侧后
+    光、对 town 是 87.5° 正侧光，三个斜视机位都能拉出长投影。
+    已知代价：城门机位那面墙的法线约在 +36°，离 68° 只有 32°，那面墙仍是顺光。
+    要让城门墙吃到掠射光，方位得挪到 120° 附近 —— 尚未改，见交付说明。
+  颜色             = #ffeccd   强度 = 3.55
+  阴影             = PCFSoftShadowMap，mapSize 4096×4096
+  正交相机半宽     = 155 m（场景半径 181 m，镇体 ±85 m；开太大阴影会糊成一团）
+  near / far       = 1 / 1248
+  bias             = -0.00035   （≈ far 跨度的 0.44 m 深度偏置）
+  normalBias       = 0.16       （4096² / 310 m ≈ 7.6 cm/texel，约 2 texel）
+  性能             = renderer.shadowMap.autoUpdate = false，加载完成后手动
+                     needsUpdate = true 渲一次；太阳静止，不每帧重画 4096² 阴影。
+  投射开关         = 全部 mesh castShadow/receiveShadow（glTF 不带此信息，GLTFLoader
+                     默认全 false）；地形圆盘（Land | *）关掉 castShadow，省一大截开销。
+  shadowSide       = FrontSide（材质虽 doubleSided，但阴影用正面渲，避免自阴影痤疮）
+
+【补光】HemisphereLight  —— TUNE.hemi
+  天空色 #9cbde2 / 地面色 #b59468 / 强度 0.30
+  —— 规格 §2.4 给的是 0.5–0.7；实测有了 PMREM 环境光之后再给 0.30 就够，
+     再高会把画面重新提灰。它的职责只剩「让阴影面蓝里透暖」，不是提亮。
+
+【天空与环境光】r = 4000 的 BackSide 天空球（ShaderMaterial，无 addon）—— TUNE.sky
+  垂直渐变（括号内是线性 RGB，≈ 后是等效 sRGB）：
+    天顶 (0.055,0.150,0.400) ≈ #4268aa
+    中段 (0.235,0.410,0.680) ≈ #85acd7  —— smoothstep(0.13, 0.55) 过渡到天顶
+    地平线暖霾 (0.910,0.805,0.620) ≈ #f5e8ce —— 暖霾带只到 h=0.085 就交回中段蓝
+    地平线以下三段渐变 ——「阳光下的远方原野」，不是一整块闷土黄：
+        h = 0     haze×1.16 ≈ #fdf1d9   受晒的暖白雾
+        h = -0.42 haze/ground 0.62 混   雾里的中调原野
+        h = -0.95 (0.235,0.252,0.270) ≈ #7e838a 远端转冷转暗
+        （航拍机位俯角 ~35°，真地平线根本不在画面里，那一大片背景全落在这段）
+  太阳盘 cos 角半径 0.99968（≈1.4°），紧光晕 pow 900，大范围辉光 pow 12
+  方位梯度 col = mix(col, col×1.16 + 暖偏置, pow(cos∠(视线,太阳), 2.0)) —— 规格 §6.2 要的
+        「太阳方向明暗梯度」，地平线以上、以下都加（俯视机位的背景大半落在以下那一段）
+  IBL：PMREMGenerator.fromScene(仅天空球) → scene.environment
+       （r160 无 Scene.environmentIntensity，强度靠各材质 envMapIntensity 控制）
+  天空球材质不过雾（否则 r=4000 会被 FogExp2 整片吃掉）。
+
+【大气】THREE.FogExp2  —— TUNE.fog
+  颜色 #d3c5a8（显示空间目标色；雾在色调映射之后混合，所以按显示值给）
+  密度 0.00170 → 约 120 m 处 20%、300 m 处 61%、500 m 处 95%，
+  远端橄榄林/葡萄园明显退远，城墙附近保持通透，形成空气透视；
+  略密也是为了让地形圆盘的边缘吃进雾里，和背景的过渡化得开一点。
+
+【色调映射】ACESFilmicToneMapping，exposure 0.86  —— TUNE.exposure
+  曝光刻意**压低**而不是调高：原版本发灰的根因是光比不足（无阴影 + 无环境光），
+  不是曝光不足，推高曝光只会更脏（规格 §7）。
+
+【材质】92 个材质全部换成三平面版本（onBeforeCompile 注入，3 个 chunk 替换点）
+  注入点：<map_fragment>（投影上下文 + albedo 采样 + bump 高度采样）
+          <roughnessmap_fragment>（由高度扰动 roughness）
+          <normal_fragment_maps>（由高度梯度扰动法线，世界空间 → 视图空间）
+  所有被注入的材质共用 customProgramCacheKey = 'monteriggioni-triplanar-v2'，只编译一个 program。
+  albedo 软混合三平面（pow(|n|,5)）；bump 硬主轴 3 采样以控成本。
+
+  世界尺度（贴图 1 个 tile 覆盖多少米 = 1 / scale）：
+    石墙/抹面/广场 4.0m · 毛石 2.9m · 道路 3.0m · 草地/原野 6.9m · 土壤 5.0m
+    葡萄园 4.8m（12 垄 / 垄距 0.4m，条纹沿世界 Z = 葡萄行方向）· 屋顶风化 3.4m
+    叶簇 2.2m · 百叶 1.0m（4 板）· 木纹 1.6m · 层理 4.0m · 细颗粒 1.2m · 井水 3.0m
+  18 张 512² albedo + 18 张 256² detail，CanvasTexture 现场烘，
+  anisotropy = min(8, 上限)，LinearMipmapLinearFilter。
+  albedo → colorSpace = SRGBColorSpace；detail（同时充当 bumpMap）保持线性。
+
+  bump 的单位是「浮雕实际深度（米）」，不是 three 默认的任意倍数：
+  detail 贴图是 0..1 归一化高度、1 texel = 1/(256×scale) 米，所以要按真实起伏给 ——
+    条石墙 3.5–4mm · 抹面 3mm · 广场 4mm · 道路/土壤 6mm · 屋顶 4mm · 草 4mm
+  （早前给到 0.024–0.034 ≈ 2.5 cm 浮雕，法线被整体掀翻，近景铺石会碎成黑白棋盘。）
+
+  各材质的 envMapIntensity：
+    石墙/毛石 0.70 · 抹面 0.85 · 屋顶 0.95 · 广场/道路 0.95 · 草地 1.00 · 土壤/葡萄园 0.95
+    石材压到 0.70 是为了按住朝上的面（垛口顶面、女墙走道）——它们正对天顶，
+    天空 IBL 全额吃进去，0.80 时会烧成一片死白。
+    叶簇 0.90 · 百叶 0.90 · 木纹 0.80 · 层理 0.90 · 陶土/檐下/窗洞 0.90
+    锻铁 1.10 · 钟楼铜 1.30 · 亚麻伞 1.10 · **井水 2.00**（低粗糙 + 高 env 靠天空反射成立）
+
+  按 OPTIMIZATION.md §3.3 的金属与特殊材质修正：
+    Forged dark iron      metalness 0.85  roughness 0.45
+    Campanile aged bronze  metalness 0.90  roughness 0.35
+    Well still dark water roughness 0.07  envMapIntensity 2.00
+    Cafe parasols linen    roughness 0.62（略降，让布面有微弱光泽）
+    叶片类（Oak / Olive / Cypress / Vineyard foliage）
+        反照率提到最大通道 ≈ 0.145（GLB 导出的 0.036–0.22 在新光照下会一片死黑）
+
+  baseColor 的两种处理：
+    tinted  = true  → 贴图自带完整颜色，baseColor 置白
+                      （石墙 / 毛石 / 抹面 / 广场 / 道路 / 草地 / 土壤 / 葡萄园）
+    tinted  = false → 贴图是均值≈0.985 的明度调制图，保留 GLB 的 baseColor
+                      （屋顶 48 个逐片色差、叶簇 18 个 tone、百叶 4 色、木材、地层、陶土等
+                        —— 这些材质的**色相信息本身就在 baseColor 里**，置白会把它们洗成同一个颜色）
+
+  贴图烘焙的调子规则（src/textures.js bakeAlbedo）：
+    **只定反照率水平，不造对比度** —— 整体缩放到 mean，高于 hi 的部分做软截断。
+    对比度完全由 field 函数决定（灰缝 / 逐块色差 / 斑驳的数值就写在那里）。
+    踩过的坑：早前同时强制「均值→mean」和「P99.9→hi」，等于做了一次 k≈5 的对比拉伸，
+    灰缝被推到 0.07（线性 0.011），阳光一照就是纯黑 —— 广场碎成黑白棋盘、墙面糊成黑底白点。
+    实测反照率水平（sRGB 0..1）：石墙 .57 / 毛石 .57 / 抹面 .60 / 广场 .56 / 道路 .57
+                              草地 .48 / 原野 .46 / 土壤 .47 / 葡萄园 .32
+
+  条石墙的做法（第二轮按验收意见重做，见 textures.js ashlarField）：
+    · 一张 4 m 的贴图里只排 8 层（层高 0.36–0.68 m）、每层 3–4 块（块宽 1.0–1.4 m）。
+      早前是 12 层 / 4–5 块，平均层高只有 0.33 m —— 10 m 高的城墙就有 30 道横缝，
+      近景直接读成一面马赛克小瓷砖。
+    · 层内逐列宽度抖动（抖动后重新归一化，总宽恒为 1，左右无缝）—— 这一条是
+      「条石墙」和「方格纸」的分水岭，之前所有列等宽所以整面墙像网格纸。
+    · 灰缝收窄到 ~1.3 cm 核心宽，且只比块面暗约 10–15%（缝里是被环境光打亮的
+      石灰砂浆，不是黑线）；卧缝比丁缝明显，打破上下左右一样重的对称。
+    · 逐块明度 ±8%、冷暖 ±3%（幅度刻意小：缝变浅之后，块间对比一大就读成棋盘）。
+    · 3 格/4 倍频的大尺度风化；竖向水渍垂流保留但压到 0.15 / 0.08 —— 上一版给到
+      0.26 / 0.13，整面墙挂满深色竖条，读成「雨渍窗帘」而不是晒过太阳的干砌条石。
+  草地（turfField）：草簇尺度放大到 1.4 m / 2.3 m 两层，干枯斑放到 2.3 m，
+    明度摆幅压掉一半，另加 0.11 m 的低幅细颗粒。
+    早前是 0.05 m 的 tuft + 0.08 m 的干斑，近景满地白黄小米粒，读起来像渲染噪点。
+
+【呈现层】
+  autoRotate 关闭 · 机位平滑补间 700ms · 键盘 1/2/3/4 切换
+  按钮：航拍 / 城镇近景 / 城门城墙（新增机位）/ 平面布局
+  四个机位（world 坐标，r = 场景半径 181 m）：
+    aerial  (center-0.85r, +0.95r, center+1.05r) → center      俯视全城
+    town    (center-0.22r, +0.22r, center+0.62r) → center      低空掠屋顶
+    gate    (25, 15.5, 117) → (-2, 8.5, 80)                   城门城墙近景
+    plan    (center, 2.6r, center+0.01) → center              正俯视，screen-right=+X、screen-up=-Z
+  加载层显示真实进度（GLB 字节进度 0–60% + 18 张贴图逐张烘焙 60–94% + 阴影首帧 96%）
+  贴图烘焙期间刻意不让出主线程，保证「模型 → 贴图 → 材质 → 阴影首帧」是一整段同步块，
+  中途不存在可被 rAF 合成出来的半成品帧。
+
+【验收钩子】window.__QA__ = { ready, setView(name), glideTo, views, diag() }
+  window.__asset = { camera, controls, scene, renderer, THREE, bounds, setView, views, sun, hemi,
+                     texMean(), texStats(), texOwners(), matInfo(name) }
+  两者都在任何 await 之前发布（tests/shots.mjs 页面 load 后 2s 就读 __asset）。
+  由 tests/shots.mjs 驱动，按「渲染帧」计数等待（headless 走 SwiftShader，单帧数秒）。
+
+【r160 纪律】不使用 AgXToneMapping(r162+) / NeutralToneMapping(r162+) /
+  Scene.environmentIntensity(r163+)；vendor/addons 只 import OrbitControls 与 GLTFLoader。
+════════════════════════════════════════════════════════════════════════════
+-->
+
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #cfd6da; }
+  #app { position: fixed; inset: 0; }
+  canvas { display: block; }
+  .caption {
+    position: fixed; left: 18px; bottom: 14px; z-index: 10;
+    font: 13px/1.6 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    color: #35526b; background: rgba(255,255,255,.55); backdrop-filter: blur(6px);
+    padding: 6px 12px; border-radius: 10px; user-select: none; pointer-events: none;
+  }
+  .views {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 10;
+    display: flex; gap: 4px; padding: 6px; border-radius: 8px;
+    background: rgba(255,255,255,.6); backdrop-filter: blur(8px);
+  }
+  .views button {
+    border: 0; border-radius: 5px; padding: 7px 14px; cursor: pointer;
+    font: 12.5px/1 system-ui, "Microsoft YaHei", sans-serif; color: #35526b;
+    background: transparent;
+  }
+  .views button:hover { background: rgba(53,82,107,.12); }
+  .views button[aria-pressed="true"] { background: #35526b; color: #f2ede1; }
+  /* 快捷键角标：让 1-4 / Q W E R 的映射直接长在按钮上，不用去读底部那行长说明 */
+  .views button kbd, .weather button kbd, .walk button kbd {
+    display: inline-block; margin-left: 5px; padding: 1px 5px; border-radius: 4px;
+    font: 10px/1.5 inherit; opacity: .62;
+    background: rgba(53,82,107,.14); box-shadow: inset 0 0 0 1px rgba(53,82,107,.22);
+  }
+  button[aria-pressed="true"] kbd {
+    background: rgba(242,237,225,.22); box-shadow: inset 0 0 0 1px rgba(242,237,225,.35);
+  }
+  /* 触屏设备没有这些键：角标纯是噪音，藏掉 */
+  @media (pointer: coarse) {
+    .views button kbd, .weather button kbd, .walk button kbd { display: none; }
+  }
+  /* 天气切换：靠右一排，机位那排居中，两者不重叠 */
+  .weather {
+    position: fixed; bottom: 16px; right: 18px; z-index: 10;
+    display: flex; gap: 4px; padding: 6px; border-radius: 8px;
+    background: rgba(255,255,255,.6); backdrop-filter: blur(8px);
+  }
+  .weather button {
+    border: 0; border-radius: 5px; padding: 7px 12px; cursor: pointer;
+    font: 12.5px/1 system-ui, "Microsoft YaHei", sans-serif; color: #35526b;
+    background: transparent;
+  }
+  .weather button:hover { background: rgba(53,82,107,.12); }
+  .weather button[aria-pressed="true"] { background: #35526b; color: #f2ede1; }
+  /* 行走模式：右上角的模式开关。放右下会和天气那排挤在一起。 */
+  .walk {
+    position: fixed; top: 16px; right: 18px; z-index: 10;
+    display: flex; gap: 4px; padding: 6px; border-radius: 8px;
+    background: rgba(255,255,255,.6); backdrop-filter: blur(8px);
+  }
+  /* 返回作品集：左上角，与行走开关同款外观 */
+  .back {
+    position: fixed; top: 16px; left: 18px; z-index: 10;
+    display: flex; align-items: center; gap: 4px;
+    padding: 12px 18px; border-radius: 8px; text-decoration: none;
+    background: rgba(255,255,255,.6); backdrop-filter: blur(8px);
+    font: 12.5px/1 system-ui, "Microsoft YaHei", sans-serif; color: #35526b;
+  }
+  .back:hover { background: rgba(53,82,107,.12); }
+  .walk button {
+    border: 0; border-radius: 5px; padding: 7px 14px; cursor: pointer;
+    font: 12.5px/1 system-ui, "Microsoft YaHei", sans-serif; color: #35526b;
+    background: transparent;
+  }
+  .walk button:hover { background: rgba(53,82,107,.12); }
+  .walk button[aria-pressed="true"] { background: #35526b; color: #f2ede1; }
+  /* 操作提示：只在行走模式出现。默认 display:none，不是 opacity —— 键盘 Tab 也不会摸到它。 */
+  .hint {
+    display: none; position: fixed; left: 18px; top: 60px; z-index: 10;
+    font: 12.5px/1.85 system-ui, "Microsoft YaHei", sans-serif; color: #35526b;
+    background: rgba(255,255,255,.55); backdrop-filter: blur(6px);
+    padding: 9px 14px; border-radius: 10px; user-select: none; pointer-events: none;
+  }
+  .hint b { color: #22394b; font-weight: 600; }
+  body.walking .hint { display: block; }
+  /* 行走模式下操作说明已经由 hint 接管，caption 那行长字再留着只是挡画面 */
+  body.walking .caption { display: none; }
+  /* 触屏虚拟摇杆（src/joystick.js 建的 DOM）：只在行走模式、只有触屏设备出现 */
+  .joystick {
+    display: none; position: fixed; left: 20px; bottom: 108px; z-index: 11;
+    width: 116px; height: 116px; border-radius: 50%;
+    background: rgba(255,255,255,.38); box-shadow: inset 0 0 0 1px rgba(53,82,107,.35);
+    backdrop-filter: blur(4px); touch-action: none; user-select: none;
+  }
+  body.walking .joystick { display: block; }
+  .joystick .base {
+    position: absolute; inset: 14px; border-radius: 50%;
+    box-shadow: inset 0 0 0 1.5px rgba(53,82,107,.3);
+  }
+  .joystick .base::after {                /* 十字准星：上=前进，一眼读懂 */
+    content: ''; position: absolute; left: 50%; top: 8px; bottom: 8px; width: 1.5px;
+    transform: translateX(-50%); background: rgba(53,82,107,.18);
+  }
+  .joystick .knob {
+    position: absolute; left: 50%; top: 50%; width: 54px; height: 54px; border-radius: 50%;
+    background: radial-gradient(circle at 34% 30%, #5d7d99, #35526b 68%);
+    box-shadow: 0 3px 12px rgba(13,25,40,.4), inset 0 1px 2px rgba(255,255,255,.35);
+    transform: translate(-50%, -50%);
+    pointer-events: none;                 /* 命中判定交给整个圆盘，杆头只是视觉 */
+  }
+  #loading {
+    position: fixed; inset: 0; z-index: 20; display: flex;
+    align-items: center; justify-content: center; flex-direction: column; gap: 14px;
+    font: 15px system-ui, "Microsoft YaHei", sans-serif; color: #4d6376;
+    background: linear-gradient(180deg, #b8d3e6 0%, #dbe7ef 55%, #e9e2d0 100%);
+    transition: opacity .6s;
+  }
+  #bar { width: 320px; height: 4px; border-radius: 3px; background: rgba(53,82,107,.16); overflow: hidden; }
+  #bar > i { display: block; height: 100%; width: 0%; background: #35526b; transition: width .25s; }
+  #loading small { font-size: 12px; color: #7d8f9d; }
+  /* ---- 窄屏（手机竖屏为主）----
+   * 机位一排居中、天气一排靠右，在 ~560px 以下必然互相压住（实测 390px）。
+   * 解法：窄屏时机位排整体上移一层，给天气排让出底边；
+   * 同时把触控目标加高（原生 27px 高的按钮手指很难按中，44px 是最低舒适线）。
+   * 行走模式下摇杆在左下 bottom:108px，与上移后的机位排（bottom:74px）纵向错开。 */
+  @media (max-width: 719px) {
+    .views { bottom: 74px; }
+    .views button, .weather button, .walk button { padding: 11px 13px; font-size: 13px; }
+    .caption {
+      left: 12px; right: 12px; bottom: 10px; max-width: none;
+      font-size: 12px; line-height: 1.5;
+    }
+    .hint { top: 64px; right: 12px; }
+  }
+  #err {
+    position: fixed; left: 12px; top: 12px; z-index: 30; display: none;
+    font: 12px/1.5 Consolas, monospace; color: #a33; background: #fff2f2;
+    border: 1px solid #ecc; padding: 8px 10px; border-radius: 8px; white-space: pre-wrap; max-width: 60vw;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "three/addons/": "./vendor/addons/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app"></div>
+<a class="back" href="../../" target="_top" title="回到 仪绘士 · 画境长廊">↩ 返回作品集</a>
+<div id="loading">
+  <div id="loadText">正在载入 27.6 MB 城镇模型……</div>
+  <div id="bar"><i></i></div>
+  <small id="loadPct">0%</small>
+</div>
+<div id="err"></div>
+<div class="views" hidden>
+  <button data-view="aerial" aria-pressed="true">航拍 <kbd>1</kbd></button>
+  <button data-view="town" aria-pressed="false">城镇近景 <kbd>2</kbd></button>
+  <button data-view="gate" aria-pressed="false">城门城墙 <kbd>3</kbd></button>
+  <button data-view="plan" aria-pressed="false">平面布局 <kbd>4</kbd></button>
+</div>
+<div class="weather" hidden>
+  <button data-weather="clear" aria-pressed="true">晴天 <kbd>Q</kbd></button>
+  <button data-weather="night" aria-pressed="false">夜晚 <kbd>W</kbd></button>
+  <button data-weather="rain" aria-pressed="false">雨天 <kbd>E</kbd></button>
+  <button data-weather="snow" aria-pressed="false">雪天 <kbd>R</kbd></button>
+</div>
+<div class="walk" hidden>
+  <button data-walk aria-pressed="false">行走 <kbd>F</kbd></button>
+  <button data-fs aria-pressed="false" hidden>全屏</button>
+</div>
+<div class="hint">
+  <b>W A S D</b> / 方向键 走动　<b>Shift</b> 跑<br>
+  <b>左键拖动</b> 转视角　<b>滚轮</b> 拉近拉远<br>
+  <b>F</b> 退出行走　<b>1–4</b> 回机位　<b>Q/E/R</b> 切天气
+</div>
+<div class="caption">Monteriggioni · 照片重建小镇 — 左键拖动旋转 · 滚轮缩放 · 右键平移 · 数字键 1/2/3/4 切机位 · Q/W/E/R 切天气 · F 进出行走</div>
+
+<script type="module">
+import { boot } from './src/app.js';
+
+const app = document.getElementById('app');
+const errBox = document.getElementById('err');
+const loadingEl = document.getElementById('loading');
+const barFill = document.querySelector('#bar > i');
+const loadText = document.getElementById('loadText');
+const loadPct = document.getElementById('loadPct');
+
+function fail(message) {
+  errBox.style.display = 'block';
+  errBox.textContent = message;
+}
+
+addEventListener('error', (e) => fail('运行时异常：' + (e.message || e.error)));
+addEventListener('unhandledrejection', (e) => fail('未处理的 Promise 异常：' + (e.reason && e.reason.message || e.reason)));
+
+function onProgress({ ratio, label }) {
+  if (label) loadText.textContent = label;
+  const pct = Math.round(ratio * 100);
+  barFill.style.width = pct + '%';
+  loadPct.textContent = pct + '%';
+}
+
+/* 触屏设备：操作说明换成触屏版 —— 键盘/滚轮的说明对手机用户全是噪音，
+ * 行走说明也要告诉他们「摇杆在哪、怎么跑」。放在 boot 之前，
+ * 加载期间用户看到的就已经是正确文案。 */
+if (matchMedia('(pointer: coarse)').matches) {
+  const cap = document.querySelector('.caption');
+  if (cap) cap.textContent = 'Monteriggioni · 照片重建小镇 — 单指拖动旋转 · 双指捏合缩放 ·「行走」进入漫步（左下摇杆控制，推到最外圈奔跑）';
+  const hint = document.querySelector('.hint');
+  if (hint) hint.innerHTML =
+    '<b>左下摇杆</b> 走动（推到最外圈＝跑）<br>' +
+    '<b>单指拖动</b> 转视角　<b>双指捏合</b> 拉近拉远<br>' +
+    '<b>右上「行走」</b> 退出漫步　天气用底部按钮切';
+}
+
+try {
+  await boot({ app, loadingEl, errBox, onProgress });
+  loadingEl.style.opacity = '0';
+  setTimeout(() => loadingEl.remove(), 700);
+} catch (error) {
+  fail('初始化失败：' + ((error && error.message) || error));
+  loadingEl.textContent = '载入失败，详见左上角。';
+}
+</script>
+</body>
+</html>
